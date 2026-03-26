@@ -3,10 +3,14 @@
  * MQTT channel plugin for Claude Code.
  *
  * Bridges MQTT messages into Claude Code sessions via the MCP channel protocol.
- * Enables cross-session messaging, Home Assistant integration, and IoT bridge.
+ * Messages are buffered by default — only admitted senders/topics flow into
+ * Claude's context. Everything else queues until explicitly read.
  *
- * State lives in ~/.claude/channels/mqtt/ — access.json for allowlists,
- * .env for broker connection.
+ * Launch: SESSION_NAME=my-session claude --dangerously-load-development-channels server:mqtt
+ *
+ * State lives in ~/.claude/channels/mqtt/:
+ *   .env            — broker connection
+ *   sessions/<name>.json — per-session admissions, mutes, and buffer config
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -15,21 +19,18 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { z } from 'zod'
 import mqtt from 'mqtt'
-import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
 const STATE_DIR = process.env.MQTT_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'mqtt')
-const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 
 // Load .env into process.env (real env wins)
 try {
-  chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
@@ -41,56 +42,117 @@ const MQTT_USERNAME = process.env.MQTT_USERNAME
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD
 const SESSION_NAME = process.env.SESSION_NAME ?? 'default'
 const QOS = parseInt(process.env.QOS ?? '1', 10) as 0 | 1 | 2
-const SUBSCRIBE_TOPICS = (process.env.SUBSCRIBE_TOPICS ?? `chachi/sessions/${SESSION_NAME}/inbox,chachi/broadcast`)
-  .split(',')
-  .map(t => t.trim())
-  .filter(Boolean)
 
-const log = (msg: string) => process.stderr.write(`[mqtt-channel] ${msg}\n`)
+const log = (msg: string) => process.stderr.write(`[mqtt-channel:${SESSION_NAME}] ${msg}\n`)
 
-// ── Access control ───────────────────────────────────────────────────────────
+// ── Per-session config (persists across restarts) ────────────────────────────
 
-interface Access {
-  allowFrom: string[]     // allowed MQTT client IDs or sender names
-  allowTopics: string[]   // topic prefixes allowed to push events
+const SESSIONS_DIR = join(STATE_DIR, 'sessions')
+mkdirSync(SESSIONS_DIR, { recursive: true })
+const SESSION_CONFIG_FILE = join(SESSIONS_DIR, `${SESSION_NAME}.json`)
+
+interface SessionConfig {
+  admitted: string[]       // sender names or topic patterns that flow directly into context
+  muted: string[]          // sender names or topic patterns to silently drop (not even buffered)
+  bufferMaxAge: number     // max age in seconds before buffer entries are dropped (default: 3600)
+  bufferMaxPerTopic: number // max buffered messages per topic (default: 50)
 }
 
-function loadAccess(): Access {
+function loadSessionConfig(): SessionConfig {
   try {
-    return JSON.parse(readFileSync(ACCESS_FILE, 'utf8'))
+    return { ...defaultConfig(), ...JSON.parse(readFileSync(SESSION_CONFIG_FILE, 'utf8')) }
   } catch {
-    return { allowFrom: ['*'], allowTopics: ['chachi/#'] }
+    return defaultConfig()
   }
 }
 
-function isAllowed(sender: string, topic: string): boolean {
-  const access = loadAccess()
-  const senderOk = access.allowFrom.includes('*') || access.allowFrom.includes(sender)
-  const topicOk = access.allowTopics.some(prefix => topic.startsWith(prefix.replace('#', '')))
-  return senderOk && topicOk
+function defaultConfig(): SessionConfig {
+  return {
+    admitted: [`chachi/sessions/${SESSION_NAME}/inbox`],  // always admit our own inbox
+    muted: [],
+    bufferMaxAge: 3600,
+    bufferMaxPerTopic: 50,
+  }
+}
+
+function saveSessionConfig(config: SessionConfig) {
+  writeFileSync(SESSION_CONFIG_FILE, JSON.stringify(config, null, 2))
+}
+
+let sessionConfig = loadSessionConfig()
+
+// ── Message buffer ───────────────────────────────────────────────────────────
+
+interface BufferedMessage {
+  topic: string
+  sender: string
+  content: string
+  timestamp: string
+}
+
+const buffer = new Map<string, BufferedMessage[]>()  // topic → messages
+
+function bufferMessage(msg: BufferedMessage) {
+  const topic = msg.topic
+  if (!buffer.has(topic)) buffer.set(topic, [])
+  const topicBuf = buffer.get(topic)!
+  topicBuf.push(msg)
+
+  // Enforce max per topic
+  while (topicBuf.length > sessionConfig.bufferMaxPerTopic) {
+    topicBuf.shift()
+  }
+
+  // Enforce max age
+  const cutoff = Date.now() - sessionConfig.bufferMaxAge * 1000
+  while (topicBuf.length > 0 && new Date(topicBuf[0].timestamp).getTime() < cutoff) {
+    topicBuf.shift()
+  }
+
+  if (topicBuf.length === 0) buffer.delete(topic)
+}
+
+function isAdmitted(sender: string, topic: string): boolean {
+  return sessionConfig.admitted.some(pattern => {
+    // Match by sender name
+    if (sender === pattern) return true
+    // Match by topic pattern (simple prefix with # wildcard)
+    const prefix = pattern.replace(/#$/, '')
+    if (topic === pattern || topic.startsWith(prefix)) return true
+    return false
+  })
+}
+
+function isMuted(sender: string, topic: string): boolean {
+  return sessionConfig.muted.some(pattern => {
+    if (sender === pattern) return true
+    const prefix = pattern.replace(/#$/, '')
+    if (topic === pattern || topic.startsWith(prefix)) return true
+    return false
+  })
 }
 
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'mqtt', version: '0.0.1' },
+  { name: 'mqtt', version: '0.1.0' },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
       tools: {},
     },
     instructions: [
-      'Messages from MQTT arrive as <channel source="mqtt" topic="..." sender="..." ts="...">.',
-      'Use the reply tool to respond to a specific topic. Use publish to send to any topic.',
+      `You are session "${SESSION_NAME}". Messages from MQTT arrive as <channel source="mqtt" topic="..." sender="..." ts="...">. Only admitted senders/topics reach you directly — everything else is buffered.`,
       '',
-      'Topic conventions:',
-      '  chachi/sessions/<name>/inbox — messages TO that session',
-      '  chachi/sessions/<name>/outbox — messages FROM that session',
-      '  chachi/broadcast — all sessions receive',
-      '  homeassistant/# — Home Assistant events',
+      'Tools:',
+      '  reply/publish — send messages to MQTT topics',
+      '  inbox — see buffered messages (not yet admitted into your context)',
+      '  admit — allow a sender or topic to flow directly into context (persists across restarts)',
+      '  mute — silently drop messages from a sender or topic (persists)',
+      '  config — view or update session settings (buffer limits, admissions, mutes)',
       '',
-      'Messages are JSON with: { sender, timestamp, type, content, reply_topic? }',
-      'If the message has a reply_topic, use that for responses.',
+      'To message another session: publish to chachi/sessions/<name>/inbox',
+      'Your inbox: chachi/sessions/' + SESSION_NAME + '/inbox',
     ].join('\n'),
   },
 )
@@ -101,7 +163,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Publish a response to an MQTT topic. Use the reply_topic from the inbound message, or specify a topic directly.',
+      description: 'Publish a response to an MQTT topic.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -122,6 +184,72 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           retain: { type: 'boolean', description: 'Retain the message on the broker (default: false)' },
         },
         required: ['topic', 'text'],
+      },
+    },
+    {
+      name: 'inbox',
+      description: 'View buffered messages. Shows summary by default, or read messages from a specific topic.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: 'Read messages from this specific topic (omit for summary)' },
+          clear: { type: 'boolean', description: 'Clear the buffer for this topic after reading' },
+        },
+      },
+    },
+    {
+      name: 'admit',
+      description: 'Allow a sender or topic pattern to flow directly into context. Persists across session restarts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Sender name or topic pattern (e.g., "email-checker" or "chachi/sessions/email-checker/#")' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'mute',
+      description: 'Silently drop messages from a sender or topic. Not even buffered. Persists across restarts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Sender name or topic pattern to mute' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'unadmit',
+      description: 'Remove a sender or topic from the admitted list. Messages will be buffered instead.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Pattern to remove from admitted list' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'unmute',
+      description: 'Remove a sender or topic from the muted list.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Pattern to remove from muted list' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'config',
+      description: 'View or update session configuration.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          bufferMaxAge: { type: 'number', description: 'Max age in seconds for buffered messages' },
+          bufferMaxPerTopic: { type: 'number', description: 'Max messages per topic in buffer' },
+        },
       },
     },
     {
@@ -146,189 +274,220 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['topic'],
       },
     },
-    {
-      name: 'list_subscriptions',
-      description: 'List current MQTT topic subscriptions.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
-    },
   ],
 }))
 
-// Track active subscriptions
-const activeSubscriptions = new Set<string>(SUBSCRIBE_TOPICS)
+const activeSubscriptions = new Set<string>([
+  `chachi/sessions/${SESSION_NAME}/inbox`,
+  'chachi/broadcast',
+])
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
+  const err = (s: string) => ({ content: [{ type: 'text' as const, text: s }], isError: true })
 
   try {
     switch (req.params.name) {
       case 'reply':
       case 'publish': {
         const topic = args.topic as string
-        const text = args.text as string
+        const msg = args.text as string
         const retain = (args.retain as boolean) ?? false
-
-        const payload = JSON.stringify({
+        mqttClient.publish(topic, JSON.stringify({
           sender: SESSION_NAME,
-          timestamp: new Date().toISOString(),
-          type: 'chat',
-          content: text,
-        })
+          ts: new Date().toISOString(),
+          content: msg,
+        }), { qos: QOS, retain })
+        return text(`Published to ${topic}`)
+      }
 
-        mqttClient.publish(topic, payload, { qos: QOS, retain })
-        return { content: [{ type: 'text' as const, text: `Published to ${topic}` }] }
+      case 'inbox': {
+        const topic = args.topic as string | undefined
+        const clear = (args.clear as boolean) ?? false
+
+        if (topic) {
+          const msgs = buffer.get(topic) ?? []
+          if (clear) buffer.delete(topic)
+          if (msgs.length === 0) return text(`No buffered messages on ${topic}`)
+          const formatted = msgs.map(m => `[${m.timestamp}] ${m.sender}: ${m.content}`).join('\n')
+          return text(`${msgs.length} message(s) on ${topic}:\n${formatted}`)
+        }
+
+        // Summary view
+        if (buffer.size === 0) return text('Buffer is empty — no pending messages.')
+        const lines: string[] = []
+        for (const [t, msgs] of buffer.entries()) {
+          const senders = [...new Set(msgs.map(m => m.sender))].join(', ')
+          lines.push(`${t}: ${msgs.length} message(s) from ${senders}`)
+        }
+        return text(`Buffered messages:\n${lines.join('\n')}`)
+      }
+
+      case 'admit': {
+        const pattern = args.pattern as string
+        if (!sessionConfig.admitted.includes(pattern)) {
+          sessionConfig.admitted.push(pattern)
+          saveSessionConfig(sessionConfig)
+        }
+        return text(`Admitted "${pattern}" — messages will flow directly into context. Persisted.`)
+      }
+
+      case 'unadmit': {
+        const pattern = args.pattern as string
+        sessionConfig.admitted = sessionConfig.admitted.filter(p => p !== pattern)
+        saveSessionConfig(sessionConfig)
+        return text(`Removed "${pattern}" from admitted list. Messages will be buffered.`)
+      }
+
+      case 'mute': {
+        const pattern = args.pattern as string
+        if (!sessionConfig.muted.includes(pattern)) {
+          sessionConfig.muted.push(pattern)
+          saveSessionConfig(sessionConfig)
+        }
+        return text(`Muted "${pattern}" — messages will be silently dropped. Persisted.`)
+      }
+
+      case 'unmute': {
+        const pattern = args.pattern as string
+        sessionConfig.muted = sessionConfig.muted.filter(p => p !== pattern)
+        saveSessionConfig(sessionConfig)
+        return text(`Unmuted "${pattern}".`)
+      }
+
+      case 'config': {
+        if (args.bufferMaxAge !== undefined) {
+          sessionConfig.bufferMaxAge = args.bufferMaxAge as number
+          saveSessionConfig(sessionConfig)
+        }
+        if (args.bufferMaxPerTopic !== undefined) {
+          sessionConfig.bufferMaxPerTopic = args.bufferMaxPerTopic as number
+          saveSessionConfig(sessionConfig)
+        }
+        return text(JSON.stringify(sessionConfig, null, 2))
       }
 
       case 'subscribe': {
         const topic = args.topic as string
         mqttClient.subscribe(topic, { qos: QOS })
         activeSubscriptions.add(topic)
-        return { content: [{ type: 'text' as const, text: `Subscribed to ${topic}` }] }
+        return text(`Subscribed to ${topic}`)
       }
 
       case 'unsubscribe': {
         const topic = args.topic as string
         mqttClient.unsubscribe(topic)
         activeSubscriptions.delete(topic)
-        return { content: [{ type: 'text' as const, text: `Unsubscribed from ${topic}` }] }
-      }
-
-      case 'list_subscriptions': {
-        const list = Array.from(activeSubscriptions).join('\n')
-        return { content: [{ type: 'text' as const, text: list || '(none)' }] }
+        return text(`Unsubscribed from ${topic}`)
       }
 
       default:
-        return { content: [{ type: 'text' as const, text: `Unknown tool: ${req.params.name}` }], isError: true }
+        return err(`Unknown tool: ${req.params.name}`)
     }
-  } catch (err) {
-    return { content: [{ type: 'text' as const, text: `Error: ${err}` }], isError: true }
+  } catch (e) {
+    return err(`Error: ${e}`)
   }
 })
 
 // ── MQTT Client ──────────────────────────────────────────────────────────────
 
-const mqttOptions: mqtt.IClientOptions = {
-  clientId: `claude-code-${SESSION_NAME}-${Date.now()}`,
+const mqttClient = mqtt.connect(BROKER_URL, {
+  clientId: `claude-${SESSION_NAME}-${Date.now()}`,
   clean: true,
   ...(MQTT_USERNAME && { username: MQTT_USERNAME }),
   ...(MQTT_PASSWORD && { password: MQTT_PASSWORD }),
   will: {
     topic: `chachi/sessions/${SESSION_NAME}/status`,
-    payload: Buffer.from(JSON.stringify({ status: 'offline', timestamp: new Date().toISOString() })),
+    payload: Buffer.from(JSON.stringify({ status: 'offline', ts: new Date().toISOString() })),
     qos: 1,
     retain: true,
   },
-}
+})
 
-log(`Connecting to ${BROKER_URL} as session "${SESSION_NAME}"...`)
-const mqttClient = mqtt.connect(BROKER_URL, mqttOptions)
+log(`Connecting to ${BROKER_URL}...`)
 
 mqttClient.on('connect', () => {
-  log(`Connected to broker`)
-
-  // Subscribe to configured topics
-  for (const topic of SUBSCRIBE_TOPICS) {
-    mqttClient.subscribe(topic, { qos: QOS }, (err) => {
-      if (err) log(`Subscribe error for ${topic}: ${err}`)
+  log('Connected to broker')
+  for (const topic of activeSubscriptions) {
+    mqttClient.subscribe(topic, { qos: QOS }, (e) => {
+      if (e) log(`Subscribe error for ${topic}: ${e}`)
       else log(`Subscribed to ${topic}`)
     })
   }
-
-  // Announce presence
   mqttClient.publish(
     `chachi/sessions/${SESSION_NAME}/status`,
-    JSON.stringify({ status: 'online', timestamp: new Date().toISOString(), session: SESSION_NAME }),
+    JSON.stringify({ status: 'online', ts: new Date().toISOString(), session: SESSION_NAME }),
     { qos: 1, retain: true },
   )
 })
 
-mqttClient.on('error', (err) => {
-  log(`MQTT error: ${err.message}`)
-})
-
-mqttClient.on('reconnect', () => {
-  log('Reconnecting to broker...')
-})
+mqttClient.on('error', (e) => log(`MQTT error: ${e.message}`))
+mqttClient.on('reconnect', () => log('Reconnecting...'))
 
 // ── Inbound message handler ─────────────────────────────────────────────────
 
 mqttClient.on('message', async (topic: string, payload: Buffer) => {
   let sender = 'unknown'
   let content = ''
-  let replyTopic = ''
 
   try {
     const msg = JSON.parse(payload.toString())
     sender = msg.sender ?? 'unknown'
     content = msg.content ?? payload.toString()
-    replyTopic = msg.reply_topic ?? ''
-
-    // Don't echo our own messages
-    if (sender === SESSION_NAME) return
   } catch {
-    // Not JSON — treat raw payload as content
     content = payload.toString()
   }
 
-  // Access control
-  if (!isAllowed(sender, topic)) {
-    log(`Dropped message from "${sender}" on ${topic} (not allowed)`)
+  // Don't echo our own messages
+  if (sender === SESSION_NAME) return
+
+  // Muted → silently drop
+  if (isMuted(sender, topic)) return
+
+  const timestamp = new Date().toISOString()
+
+  // Admitted → push directly into Claude's context
+  if (isAdmitted(sender, topic)) {
+    log(`[admitted] ${sender} on ${topic}: ${content.substring(0, 80)}`)
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content,
+          meta: { source: 'mqtt', topic, sender, ts: timestamp },
+        },
+      })
+    } catch (e) {
+      log(`Failed to push notification: ${e}`)
+    }
     return
   }
 
-  log(`Message from "${sender}" on ${topic}: ${content.substring(0, 100)}`)
-
-  // Push into Claude Code as a channel event
-  try {
-    await mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content,
-        meta: {
-          source: 'mqtt',
-          topic,
-          sender,
-          ts: new Date().toISOString(),
-          ...(replyTopic && { reply_topic: replyTopic }),
-        },
-      },
-    })
-  } catch (err) {
-    log(`Failed to push notification: ${err}`)
-  }
+  // Not admitted → buffer
+  log(`[buffered] ${sender} on ${topic}: ${content.substring(0, 80)}`)
+  bufferMessage({ topic, sender, content, timestamp })
 })
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 function shutdown() {
   log('Shutting down...')
-  // Clear presence
   mqttClient.publish(
     `chachi/sessions/${SESSION_NAME}/status`,
-    JSON.stringify({ status: 'offline', timestamp: new Date().toISOString() }),
+    JSON.stringify({ status: 'offline', ts: new Date().toISOString() }),
     { qos: 1, retain: true },
-    () => {
-      mqttClient.end()
-      process.exit(0)
-    },
+    () => { mqttClient.end(); process.exit(0) },
   )
 }
 
-process.on('unhandledRejection', (err) => {
-  log(`Unhandled rejection: ${err}`)
-})
-process.on('uncaughtException', (err) => {
-  log(`Uncaught exception: ${err}`)
-})
+process.on('unhandledRejection', (e) => log(`Unhandled rejection: ${e}`))
+process.on('uncaughtException', (e) => log(`Uncaught exception: ${e}`))
 process.stdin.on('end', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-// ── Start MCP transport ──────────────────────────────────────────────────────
+// ── Start ────────────────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport())
-log('MCP transport connected — MQTT channel ready')
+log(`MCP ready — session "${SESSION_NAME}"`)
