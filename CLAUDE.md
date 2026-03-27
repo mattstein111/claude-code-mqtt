@@ -4,7 +4,7 @@ MQTT channel plugin for Claude Code. This is a **public open-source repo** — a
 
 ## What this is
 
-An MCP server (TypeScript/Bun) that bridges MQTT messages into Claude Code sessions via the channel protocol. ~560 lines, single file (`server.ts`).
+An MCP server (TypeScript/Bun) that bridges MQTT messages into Claude Code sessions via the channel protocol. Single file (`server.ts`).
 
 ### Core design: three-tier gating
 

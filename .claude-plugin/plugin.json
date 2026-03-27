@@ -1,14 +1,10 @@
 {
   "name": "mqtt",
   "description": "MQTT channel plugin for Claude Code - cross-session messaging, Home Assistant integration, and IoT bridge via pub/sub",
-  "version": "0.2.0",
-  "keywords": [
-    "mqtt",
-    "messaging",
-    "channel",
-    "mcp",
-    "iot",
-    "home-assistant",
-    "pub-sub"
-  ]
+  "version": "0.3.0",
+  "author": { "name": "Matt Stein", "url": "https://github.com/mattstein111" },
+  "license": "MIT",
+  "repository": "https://github.com/mattstein111/claude-code-mqtt",
+  "keywords": ["mqtt", "messaging", "channel", "mcp", "iot", "home-assistant", "pub-sub"],
+  "mcpServers": "./.mcp.json"
 }

@@ -10,7 +10,7 @@ This plugin connects a Claude Code session to any standard MQTT broker. Messages
 
 ## The gating model
 
-An MQTT broker on a busy network can have hundreds of messages per second. If all of that landed in Claude's context, the session would be overwhelmed. So messages are filtered into three tiers:
+An MQTT broker on a busy network can have hundreds of messages per second. If all of that landed in Claude's context, the session would be overwhelmed. So messages are filtered through a gating model:
 
 | Tier | Behavior |
 |---|---|
@@ -22,6 +22,8 @@ An MQTT broker on a busy network can have hundreds of messages per second. If al
 Agents stay lean by default. They only see what they've explicitly opted into.
 
 Admission, watch, and mute lists persist across session restarts in a JSON config file. Each session gets its own config — the email session admits different things than the coding session.
+
+**Topic matching:** Patterns support the MQTT `#` multi-level wildcard as a suffix (e.g., `homeassistant/sensor/#` matches all subtopics). The `+` single-level wildcard is not currently supported in gating patterns — use specific topic paths or `#` suffixes instead.
 
 ## Message format
 
@@ -61,6 +63,8 @@ Any coordinator can passively monitor agent health by reading retained status me
 - `status: online` + recent `lastSeen` → healthy
 - `status: offline` → graceful shutdown or LWT fired
 - `status: online` + stale `lastSeen` → frozen/hung, needs attention
+
+**Note:** The Last Will timestamp is set when the client connects (an MQTT protocol limitation). If the broker delivers the LWT hours later after a crash, the `ts` field will reflect connection time, not actual disconnect time. Use `lastSeen` from the most recent heartbeat for accurate timing.
 
 ## Setup
 
@@ -178,7 +182,7 @@ sessions/<name>.json        # Per-session config (auto-created)
 | `QOS` | `1` | MQTT QoS level (0, 1, or 2) |
 | `HEARTBEAT_INTERVAL` | `60` | Seconds between status heartbeats |
 | `MQTT_REQUEST_TIMEOUT` | `120` | Seconds to wait for a correlated response |
-| `MQTT_MAX_PAYLOAD_BYTES` | `20971520` | Max inbound payload size (20MB) |
+| `MQTT_MAX_PAYLOAD_BYTES` | `262144` | Max inbound payload size (256KB) |
 | `MQTT_MAX_PENDING_REQUESTS` | `50` | Max concurrent pending request/reply operations |
 
 ### Session config (JSON)
@@ -192,6 +196,23 @@ sessions/<name>.json        # Per-session config (auto-created)
   "bufferMaxPerTopic": 50
 }
 ```
+
+## Security considerations
+
+### Threat model
+
+This plugin bridges an MQTT broker into an LLM's context window. **Any message that passes the gating filters (admitted or watched) reaches the agent.** This means:
+
+- **Broker authentication is your perimeter.** The plugin does not add its own auth layer — it trusts whatever the broker allows. Use broker-level ACLs, username/password, or TLS client certificates to control who can publish.
+- **Admitted messages flow verbatim into the agent's context.** A malicious publisher on an admitted topic could attempt prompt injection. Mitigations:
+  - Only admit topics you fully control or trust
+  - Use the `watch` + `inbox` pull model for untrusted sources — the agent explicitly requests these messages and can inspect them with more scrutiny
+  - Keep admission lists narrow (specific topics, not broad wildcards)
+- **Content size** — inbound payloads are capped at 256KB by default (`MQTT_MAX_PAYLOAD_BYTES`). Adjust this if your use case requires larger messages, but be aware that large payloads consume context window space.
+
+### Reporting vulnerabilities
+
+If you find a security issue, please open a [GitHub issue](https://github.com/mattstein111/claude-code-mqtt/issues) or email the maintainer directly.
 
 ## License
 

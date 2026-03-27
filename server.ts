@@ -43,11 +43,19 @@ const BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://localhost:1883'
 const MQTT_USERNAME = process.env.MQTT_USERNAME
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD
 const TOPIC_PREFIX = process.env.MQTT_TOPIC_PREFIX ?? 'claude'
-const QOS = parseInt(process.env.QOS ?? '1', 10) as 0 | 1 | 2
-const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL ?? '60', 10) * 1000  // default: 60s
-const REQUEST_TIMEOUT = parseInt(process.env.MQTT_REQUEST_TIMEOUT ?? '120', 10) * 1000  // default: 120s
-const MAX_PAYLOAD_BYTES = parseInt(process.env.MQTT_MAX_PAYLOAD_BYTES ?? String(20 * 1024 * 1024), 10) // default: 20MB
-const MAX_PENDING_REQUESTS = parseInt(process.env.MQTT_MAX_PENDING_REQUESTS ?? '50', 10) // default: 50
+function safeParseInt(value: string | undefined, fallback: number, min?: number, max?: number): number {
+  const n = parseInt(value ?? String(fallback), 10)
+  if (isNaN(n)) return fallback
+  if (min !== undefined && n < min) return min
+  if (max !== undefined && n > max) return max
+  return n
+}
+
+const QOS = safeParseInt(process.env.QOS, 1, 0, 2) as 0 | 1 | 2
+const HEARTBEAT_INTERVAL = safeParseInt(process.env.HEARTBEAT_INTERVAL, 60, 1) * 1000
+const REQUEST_TIMEOUT = safeParseInt(process.env.MQTT_REQUEST_TIMEOUT, 120, 1) * 1000
+const MAX_PAYLOAD_BYTES = safeParseInt(process.env.MQTT_MAX_PAYLOAD_BYTES, 256 * 1024, 1024) // default: 256KB
+const MAX_PENDING_REQUESTS = safeParseInt(process.env.MQTT_MAX_PENDING_REQUESTS, 50, 1)
 
 // Sanitize session name to prevent path traversal
 const RAW_SESSION_NAME = process.env.SESSION_NAME ?? 'default'
@@ -139,33 +147,31 @@ function bufferMessage(msg: BufferedMessage) {
   if (topicBuf.length === 0) buffer.delete(topic)
 }
 
+function matchesPattern(sender: string, topic: string, pattern: string): boolean {
+  // Exact match by sender name
+  if (sender === pattern) return true
+  // Exact match by topic
+  if (topic === pattern) return true
+  // Match by topic pattern with # multi-level wildcard (must follow a /)
+  if (pattern.endsWith('/#')) {
+    const prefix = pattern.slice(0, -1) // keep the trailing /
+    if (topic.startsWith(prefix)) return true
+  } else if (pattern === '#') {
+    return true // match everything
+  }
+  return false
+}
+
 function isAdmitted(sender: string, topic: string): boolean {
-  return sessionConfig.admitted.some(pattern => {
-    // Match by sender name
-    if (sender === pattern) return true
-    // Match by topic pattern (simple prefix with # wildcard)
-    const prefix = pattern.replace(/#$/, '')
-    if (topic === pattern || topic.startsWith(prefix)) return true
-    return false
-  })
+  return sessionConfig.admitted.some(p => matchesPattern(sender, topic, p))
 }
 
 function isMuted(sender: string, topic: string): boolean {
-  return sessionConfig.muted.some(pattern => {
-    if (sender === pattern) return true
-    const prefix = pattern.replace(/#$/, '')
-    if (topic === pattern || topic.startsWith(prefix)) return true
-    return false
-  })
+  return sessionConfig.muted.some(p => matchesPattern(sender, topic, p))
 }
 
 function isWatched(sender: string, topic: string): boolean {
-  return sessionConfig.watched.some(pattern => {
-    if (sender === pattern) return true
-    const prefix = pattern.replace(/#$/, '')
-    if (topic === pattern || topic.startsWith(prefix)) return true
-    return false
-  })
+  return sessionConfig.watched.some(p => matchesPattern(sender, topic, p))
 }
 
 // ── Pending requests (correlation ID tracking) ───────────────────────────────
@@ -182,7 +188,7 @@ const pendingRequests = new Map<string, PendingRequest>()
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'mqtt', version: '0.2.0' },
+  { name: 'mqtt', version: '0.3.0' },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
@@ -312,7 +318,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'unadmit',
-      description: 'Remove a sender or topic from the admitted list. Messages will be discarded unless also watched.',
+      description: 'Remove a sender or topic from the admitted list. Messages will be discarded unless the pattern is also watched.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -377,12 +383,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
   const err = (s: string) => ({ content: [{ type: 'text' as const, text: s }], isError: true })
 
+  function requireString(name: string): string {
+    const v = args[name]
+    if (typeof v !== 'string' || v.length === 0) throw new Error(`Missing or invalid "${name}" — must be a non-empty string`)
+    return v
+  }
+
   try {
     switch (req.params.name) {
       case 'reply':
       case 'publish': {
-        const topic = args.topic as string
-        const msg = args.text as string
+        const topic = requireString('topic')
+        const msg = requireString('text')
         const retain = (args.retain as boolean) ?? false
         const correlationId = args.correlation_id as string | undefined
         const raw = (args.raw as boolean) ?? false
@@ -400,10 +412,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
           return err(`Too many pending requests (${MAX_PENDING_REQUESTS}). Wait for existing requests to complete.`)
         }
-        const target = args.target as string
-        const msg = args.text as string
-        const timeoutSecs = (args.timeout as number) ?? (REQUEST_TIMEOUT / 1000)
-        const correlationId = randomUUID().slice(0, 8)
+        const target = requireString('target')
+        const msg = requireString('text')
+        const rawTimeout = typeof args.timeout === 'number' ? args.timeout : REQUEST_TIMEOUT / 1000
+        const timeoutSecs = Math.max(1, Math.min(rawTimeout, 600))
+        const correlationId = randomUUID()
         const targetTopic = topics.sessionInbox(target)
 
         // Publish the request with correlation_id and reply_to
@@ -435,7 +448,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
           return text(`Response from ${target}: ${response}`)
         } catch (e) {
-          return err(`${e}`)
+          return err(e instanceof Error ? e.message : String(e))
         }
       }
 
@@ -462,7 +475,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'admit': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         if (!sessionConfig.admitted.includes(pattern)) {
           sessionConfig.admitted.push(pattern)
           saveSessionConfig(sessionConfig)
@@ -475,18 +488,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'unadmit': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         sessionConfig.admitted = sessionConfig.admitted.filter(p => p !== pattern)
         saveSessionConfig(sessionConfig)
         if (!sessionConfig.watched.includes(pattern)) {
           mqttClient.unsubscribe(pattern)
           activeSubscriptions.delete(pattern)
         }
-        return text(`Removed "${pattern}" from admitted list. Messages will be buffered.`)
+        const willBuffer = sessionConfig.watched.includes(pattern)
+        return text(`Removed "${pattern}" from admitted list. Messages will be ${willBuffer ? 'buffered (still watched)' : 'discarded'}.`)
       }
 
       case 'mute': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         if (!sessionConfig.muted.includes(pattern)) {
           sessionConfig.muted.push(pattern)
           saveSessionConfig(sessionConfig)
@@ -495,14 +509,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'unmute': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         sessionConfig.muted = sessionConfig.muted.filter(p => p !== pattern)
         saveSessionConfig(sessionConfig)
         return text(`Unmuted "${pattern}".`)
       }
 
       case 'watch': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         if (!sessionConfig.watched.includes(pattern)) {
           sessionConfig.watched.push(pattern)
           saveSessionConfig(sessionConfig)
@@ -515,7 +529,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'unwatch': {
-        const pattern = args.pattern as string
+        const pattern = requireString('pattern')
         sessionConfig.watched = sessionConfig.watched.filter(p => p !== pattern)
         saveSessionConfig(sessionConfig)
         if (!sessionConfig.admitted.includes(pattern)) {
@@ -523,36 +537,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           activeSubscriptions.delete(pattern)
         }
         // Clear any buffered messages for this pattern
-        for (const topic of buffer.keys()) {
-          const prefix = pattern.replace(/#$/, '')
-          if (topic === pattern || topic.startsWith(prefix)) {
-            buffer.delete(topic)
-          }
-        }
+        const toDelete = [...buffer.keys()].filter(topic => matchesPattern('', topic, pattern))
+        for (const topic of toDelete) buffer.delete(topic)
         return text(`Stopped watching "${pattern}". Buffer cleared.`)
       }
 
       case 'config': {
-        if (args.bufferMaxAge !== undefined) {
-          sessionConfig.bufferMaxAge = args.bufferMaxAge as number
-          saveSessionConfig(sessionConfig)
+        let changed = false
+        if (typeof args.bufferMaxAge === 'number' && args.bufferMaxAge > 0) {
+          sessionConfig.bufferMaxAge = Math.floor(args.bufferMaxAge)
+          changed = true
         }
-        if (args.bufferMaxPerTopic !== undefined) {
-          sessionConfig.bufferMaxPerTopic = args.bufferMaxPerTopic as number
-          saveSessionConfig(sessionConfig)
+        if (typeof args.bufferMaxPerTopic === 'number' && args.bufferMaxPerTopic > 0) {
+          sessionConfig.bufferMaxPerTopic = Math.floor(args.bufferMaxPerTopic)
+          changed = true
         }
+        if (changed) saveSessionConfig(sessionConfig)
         return text(JSON.stringify(sessionConfig, null, 2))
       }
 
       case 'subscribe': {
-        const topic = args.topic as string
+        const topic = requireString('topic')
         mqttClient.subscribe(topic, { qos: QOS })
         activeSubscriptions.add(topic)
-        return text(`Subscribed to ${topic}`)
+        return text(`Subscribed to ${topic}. Note: messages will only be delivered if the topic is also admitted or watched.`)
       }
 
       case 'unsubscribe': {
-        const topic = args.topic as string
+        const topic = requireString('topic')
         mqttClient.unsubscribe(topic)
         activeSubscriptions.delete(topic)
         return text(`Unsubscribed from ${topic}`)
@@ -562,7 +574,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return err(`Unknown tool: ${req.params.name}`)
     }
   } catch (e) {
-    return err(`Error: ${e}`)
+    return err(e instanceof Error ? e.message : String(e))
   }
 })
 
@@ -628,14 +640,15 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
   let correlationId: string | undefined
   let replyTo: string | undefined
 
+  const raw = payload.toString()
   try {
-    const msg = JSON.parse(payload.toString())
+    const msg = JSON.parse(raw)
     sender = msg.sender ?? 'unknown'
-    content = msg.content ?? payload.toString()
+    content = msg.content ?? raw
     correlationId = msg.correlation_id
     replyTo = msg.reply_to
   } catch {
-    content = payload.toString()
+    content = raw
   }
 
   // Don't echo our own messages
@@ -694,6 +707,13 @@ function shutdown() {
   log('Shutting down...')
   clearInterval(heartbeat)
 
+  // Force exit if graceful shutdown stalls (e.g., broker unreachable)
+  const forceExit = setTimeout(() => {
+    log('Shutdown timeout — forcing exit')
+    process.exit(1)
+  }, 5000)
+  forceExit.unref()
+
   // Clean up pending requests
   for (const [id, pending] of pendingRequests) {
     clearTimeout(pending.timer)
@@ -710,7 +730,10 @@ function shutdown() {
 }
 
 process.on('unhandledRejection', (e) => log(`Unhandled rejection: ${e}`))
-process.on('uncaughtException', (e) => log(`Uncaught exception: ${e}`))
+process.on('uncaughtException', (e) => {
+  log(`Uncaught exception: ${e}`)
+  process.exit(1)
+})
 process.stdin.on('end', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)

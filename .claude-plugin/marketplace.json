@@ -11,7 +11,7 @@
       "name": "mqtt",
       "source": "./",
       "description": "MQTT channel plugin - bridges MQTT messages into Claude Code sessions for cross-session communication, Home Assistant integration, and IoT workflows",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }
