@@ -467,6 +467,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           sessionConfig.admitted.push(pattern)
           saveSessionConfig(sessionConfig)
         }
+        if (!activeSubscriptions.has(pattern)) {
+          mqttClient.subscribe(pattern, { qos: QOS })
+          activeSubscriptions.add(pattern)
+        }
         return text(`Admitted "${pattern}" — messages will flow directly into context. Persisted.`)
       }
 
@@ -474,6 +478,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const pattern = args.pattern as string
         sessionConfig.admitted = sessionConfig.admitted.filter(p => p !== pattern)
         saveSessionConfig(sessionConfig)
+        if (!sessionConfig.watched.includes(pattern)) {
+          mqttClient.unsubscribe(pattern)
+          activeSubscriptions.delete(pattern)
+        }
         return text(`Removed "${pattern}" from admitted list. Messages will be buffered.`)
       }
 
@@ -499,6 +507,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           sessionConfig.watched.push(pattern)
           saveSessionConfig(sessionConfig)
         }
+        if (!activeSubscriptions.has(pattern)) {
+          mqttClient.subscribe(pattern, { qos: QOS })
+          activeSubscriptions.add(pattern)
+        }
         return text(`Watching "${pattern}" — messages will buffer silently. Use inbox to read them.`)
       }
 
@@ -506,6 +518,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const pattern = args.pattern as string
         sessionConfig.watched = sessionConfig.watched.filter(p => p !== pattern)
         saveSessionConfig(sessionConfig)
+        if (!sessionConfig.admitted.includes(pattern)) {
+          mqttClient.unsubscribe(pattern)
+          activeSubscriptions.delete(pattern)
+        }
         // Clear any buffered messages for this pattern
         for (const topic of buffer.keys()) {
           const prefix = pattern.replace(/#$/, '')
@@ -579,6 +595,10 @@ function publishStatus() {
 
 mqttClient.on('connect', () => {
   log('Connected to broker')
+  // Subscribe to persisted admitted/watched topics
+  for (const pattern of [...sessionConfig.admitted, ...sessionConfig.watched]) {
+    if (!activeSubscriptions.has(pattern)) activeSubscriptions.add(pattern)
+  }
   for (const topic of activeSubscriptions) {
     mqttClient.subscribe(topic, { qos: QOS }, (e) => {
       if (e) log(`Subscribe error for ${topic}: ${e}`)
