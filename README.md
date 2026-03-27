@@ -41,7 +41,31 @@ Any coordinator can passively monitor agent health by reading retained status me
 - An MQTT broker (e.g., [Mosquitto](https://mosquitto.org/)) — if you run Home Assistant, you probably already have one
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 
-### Install
+### Install as Claude Code plugin
+
+```bash
+claude plugin install mqtt@mattstein111/claude-code-mqtt
+```
+
+### Run
+
+```bash
+SESSION_NAME=primary claude --channels plugin:mqtt@mattstein111/claude-code-mqtt
+```
+
+The session name identifies this agent on the network. Other sessions (or anything that can publish to MQTT) can send messages to `claude/sessions/primary/inbox`.
+
+### Configure
+
+The plugin reads broker settings from `~/.claude/channels/mqtt/.env`:
+
+```bash
+MQTT_BROKER_URL=mqtt://localhost:1883
+MQTT_USERNAME=your_user
+MQTT_PASSWORD=your_pass
+```
+
+### Install from source (development)
 
 ```bash
 git clone https://github.com/mattstein111/claude-code-mqtt.git
@@ -49,20 +73,11 @@ cd claude-code-mqtt
 bun install
 ```
 
-### Configure
-
-```bash
-cp .env.example .env
-# Edit .env with your broker URL and credentials
-```
-
-### Run
+Run from source using the dev channels flag:
 
 ```bash
 SESSION_NAME=primary claude --dangerously-load-development-channels server:mqtt
 ```
-
-The session name identifies this agent on the network. Other sessions (or anything that can publish to MQTT) can send messages to `claude/sessions/primary/inbox`.
 
 ## Tools
 

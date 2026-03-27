@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "description": "MQTT channel plugin for Claude Code — cross-session messaging, Home Assistant integration, and IoT bridge",
   "type": "module",
+  "bin": "./server.ts",
   "scripts": {
     "start": "bun run server.ts",
     "dev": "bun run --watch server.ts",
