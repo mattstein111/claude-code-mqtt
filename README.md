@@ -47,6 +47,14 @@ Any coordinator can passively monitor agent health by reading retained status me
 claude plugin install mqtt@mattstein111/claude-code-mqtt
 ```
 
+To install for a specific project only (keeps it out of your other sessions):
+
+```bash
+claude plugin install mqtt@mattstein111/claude-code-mqtt --scope local
+```
+
+Use `--scope local` when you only need MQTT in certain projects — for example, a home automation repo that talks to your broker but not your other coding sessions.
+
 ### Run
 
 ```bash
