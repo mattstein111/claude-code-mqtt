@@ -24,6 +24,7 @@ import mqtt from 'mqtt'
 import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { randomUUID } from 'crypto'
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -42,10 +43,21 @@ const BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://localhost:1883'
 const MQTT_USERNAME = process.env.MQTT_USERNAME
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD
 const SESSION_NAME = process.env.SESSION_NAME ?? 'default'
+const TOPIC_PREFIX = process.env.MQTT_TOPIC_PREFIX ?? 'chachi'
 const QOS = parseInt(process.env.QOS ?? '1', 10) as 0 | 1 | 2
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL ?? '60', 10) * 1000  // default: 60s
+const REQUEST_TIMEOUT = parseInt(process.env.MQTT_REQUEST_TIMEOUT ?? '120', 10) * 1000  // default: 120s
 
 const log = (msg: string) => process.stderr.write(`[mqtt-channel:${SESSION_NAME}] ${msg}\n`)
+
+// ── Topic helpers ────────────────────────────────────────────────────────────
+
+const topics = {
+  inbox: () => `${TOPIC_PREFIX}/sessions/${SESSION_NAME}/inbox`,
+  status: () => `${TOPIC_PREFIX}/sessions/${SESSION_NAME}/status`,
+  broadcast: () => `${TOPIC_PREFIX}/broadcast`,
+  sessionInbox: (name: string) => `${TOPIC_PREFIX}/sessions/${name}/inbox`,
+}
 
 // ── Per-session config (persists across restarts) ────────────────────────────
 
@@ -71,7 +83,7 @@ function loadSessionConfig(): SessionConfig {
 
 function defaultConfig(): SessionConfig {
   return {
-    admitted: [`chachi/sessions/${SESSION_NAME}/inbox`],  // always admit our own inbox
+    admitted: [topics.inbox()],  // always admit our own inbox
     muted: [],
     watched: [],
     bufferMaxAge: 3600,
@@ -145,10 +157,21 @@ function isWatched(sender: string, topic: string): boolean {
   })
 }
 
+// ── Pending requests (correlation ID tracking) ───────────────────────────────
+
+interface PendingRequest {
+  correlationId: string
+  replyTopic: string
+  resolve: (response: string) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+const pendingRequests = new Map<string, PendingRequest>()
+
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'mqtt', version: '0.1.0' },
+  { name: 'mqtt', version: '0.2.0' },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
@@ -161,14 +184,18 @@ const mcp = new Server(
       '',
       'Tools:',
       '  reply/publish — send messages to MQTT topics',
+      '  request — send a message and wait for a correlated response (synchronous request/reply pattern)',
       '  admit — allow a sender or topic to flow directly into context (persists)',
       '  mute — silently drop messages from a sender or topic (persists)',
       '  watch — buffer messages from a topic for on-demand reading (pull model)',
       '  inbox — read buffered messages from watched topics',
       '  config — view or update session settings',
       '',
-      'To message another session: publish to chachi/sessions/<name>/inbox',
-      'Your inbox: chachi/sessions/' + SESSION_NAME + '/inbox',
+      `To message another session: publish to ${TOPIC_PREFIX}/sessions/<name>/inbox`,
+      `Your inbox: ${topics.inbox()}`,
+      '',
+      'For request/reply: use the request tool which sends a message with a correlation_id',
+      'and waits for a response on your inbox with the same correlation_id.',
     ].join('\n'),
   },
 )
@@ -185,6 +212,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           topic: { type: 'string', description: 'MQTT topic to publish to' },
           text: { type: 'string', description: 'Message content' },
+          correlation_id: { type: 'string', description: 'Optional correlation ID if replying to a request' },
         },
         required: ['topic', 'text'],
       },
@@ -200,6 +228,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           retain: { type: 'boolean', description: 'Retain the message on the broker (default: false)' },
         },
         required: ['topic', 'text'],
+      },
+    },
+    {
+      name: 'request',
+      description: 'Send a message to another session and wait for a correlated response. Use this for task delegation where you need a result back.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target: { type: 'string', description: 'Target session name (publishes to their inbox)' },
+          text: { type: 'string', description: 'The request message' },
+          timeout: { type: 'number', description: `Timeout in seconds (default: ${REQUEST_TIMEOUT / 1000})` },
+        },
+        required: ['target', 'text'],
       },
     },
     {
@@ -241,7 +282,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: 'Sender name or topic pattern (e.g., "email-checker" or "chachi/sessions/email-checker/#")' },
+          pattern: { type: 'string', description: 'Sender name or topic pattern (e.g., "email-checker" or topic prefix)' },
         },
         required: ['pattern'],
       },
@@ -316,8 +357,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }))
 
 const activeSubscriptions = new Set<string>([
-  `chachi/sessions/${SESSION_NAME}/inbox`,
-  'chachi/broadcast',
+  topics.inbox(),
+  topics.broadcast(),
 ])
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -332,12 +373,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const topic = args.topic as string
         const msg = args.text as string
         const retain = (args.retain as boolean) ?? false
+        const correlationId = args.correlation_id as string | undefined
         mqttClient.publish(topic, JSON.stringify({
           sender: SESSION_NAME,
           ts: new Date().toISOString(),
           content: msg,
+          ...(correlationId && { correlation_id: correlationId }),
         }), { qos: QOS, retain })
         return text(`Published to ${topic}`)
+      }
+
+      case 'request': {
+        const target = args.target as string
+        const msg = args.text as string
+        const timeoutSecs = (args.timeout as number) ?? (REQUEST_TIMEOUT / 1000)
+        const correlationId = randomUUID().slice(0, 8)
+        const targetTopic = topics.sessionInbox(target)
+
+        // Publish the request with correlation_id and reply_to
+        mqttClient.publish(targetTopic, JSON.stringify({
+          sender: SESSION_NAME,
+          ts: new Date().toISOString(),
+          content: msg,
+          correlation_id: correlationId,
+          reply_to: topics.inbox(),
+        }), { qos: QOS })
+
+        log(`[request] Sent to ${target} (correlation: ${correlationId}): ${msg.substring(0, 80)}`)
+
+        // Wait for correlated response
+        try {
+          const response = await new Promise<string>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              pendingRequests.delete(correlationId)
+              reject(new Error(`Request to ${target} timed out after ${timeoutSecs}s`))
+            }, timeoutSecs * 1000)
+
+            pendingRequests.set(correlationId, {
+              correlationId,
+              replyTopic: topics.inbox(),
+              resolve,
+              timer,
+            })
+          })
+
+          return text(`Response from ${target}: ${response}`)
+        } catch (e) {
+          return err(`${e}`)
+        }
       }
 
       case 'inbox': {
@@ -459,7 +542,7 @@ const mqttClient = mqtt.connect(BROKER_URL, {
   ...(MQTT_USERNAME && { username: MQTT_USERNAME }),
   ...(MQTT_PASSWORD && { password: MQTT_PASSWORD }),
   will: {
-    topic: `chachi/sessions/${SESSION_NAME}/status`,
+    topic: topics.status(),
     payload: Buffer.from(JSON.stringify({ status: 'offline', ts: new Date().toISOString() })),
     qos: 1,
     retain: true,
@@ -472,7 +555,7 @@ const startedAt = new Date().toISOString()
 
 function publishStatus() {
   mqttClient.publish(
-    `chachi/sessions/${SESSION_NAME}/status`,
+    topics.status(),
     JSON.stringify({ status: 'online', lastSeen: new Date().toISOString(), startedAt, session: SESSION_NAME }),
     { qos: 1, retain: true },
   )
@@ -500,11 +583,15 @@ mqttClient.on('reconnect', () => log('Reconnecting...'))
 mqttClient.on('message', async (topic: string, payload: Buffer) => {
   let sender = 'unknown'
   let content = ''
+  let correlationId: string | undefined
+  let replyTo: string | undefined
 
   try {
     const msg = JSON.parse(payload.toString())
     sender = msg.sender ?? 'unknown'
     content = msg.content ?? payload.toString()
+    correlationId = msg.correlation_id
+    replyTo = msg.reply_to
   } catch {
     content = payload.toString()
   }
@@ -512,10 +599,25 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
   // Don't echo our own messages
   if (sender === SESSION_NAME) return
 
+  // Check if this is a response to a pending request
+  if (correlationId && pendingRequests.has(correlationId)) {
+    const pending = pendingRequests.get(correlationId)!
+    clearTimeout(pending.timer)
+    pendingRequests.delete(correlationId)
+    log(`[response] Received correlated response (${correlationId}) from ${sender}`)
+    pending.resolve(content)
+    return
+  }
+
   // Muted → silently drop
   if (isMuted(sender, topic)) return
 
   const timestamp = new Date().toISOString()
+
+  // Build meta with standard fields + request context if present
+  const meta: Record<string, string> = { source: 'mqtt', topic, sender, ts: timestamp }
+  if (correlationId) meta.correlation_id = correlationId
+  if (replyTo) meta.reply_to = replyTo
 
   // Admitted → push directly into Claude's context
   if (isAdmitted(sender, topic)) {
@@ -523,10 +625,7 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
     try {
       await mcp.notification({
         method: 'notifications/claude/channel',
-        params: {
-          content,
-          meta: { source: 'mqtt', topic, sender, ts: timestamp },
-        },
+        params: { content, meta },
       })
     } catch (e) {
       log(`Failed to push notification: ${e}`)
@@ -550,8 +649,16 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
 function shutdown() {
   log('Shutting down...')
   clearInterval(heartbeat)
+
+  // Clean up pending requests
+  for (const [id, pending] of pendingRequests) {
+    clearTimeout(pending.timer)
+    pending.resolve('Session shutting down')
+    pendingRequests.delete(id)
+  }
+
   mqttClient.publish(
-    `chachi/sessions/${SESSION_NAME}/status`,
+    topics.status(),
     JSON.stringify({ status: 'offline', lastSeen: new Date().toISOString(), startedAt, session: SESSION_NAME }),
     { qos: 1, retain: true },
     () => { mqttClient.end(); process.exit(0) },
@@ -567,4 +674,4 @@ process.on('SIGINT', shutdown)
 // ── Start ────────────────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport())
-log(`MCP ready — session "${SESSION_NAME}"`)
+log(`MCP ready — session "${SESSION_NAME}" (prefix: ${TOPIC_PREFIX})`)
