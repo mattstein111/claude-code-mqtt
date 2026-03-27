@@ -230,13 +230,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'publish',
-      description: 'Publish a message to any MQTT topic.',
+      description: 'Publish a message to any MQTT topic. Use raw=true to send the text as-is without the JSON envelope.',
       inputSchema: {
         type: 'object',
         properties: {
           topic: { type: 'string', description: 'MQTT topic' },
           text: { type: 'string', description: 'Message content' },
           retain: { type: 'boolean', description: 'Retain the message on the broker (default: false)' },
+          raw: { type: 'boolean', description: 'Send text as-is without JSON envelope (default: false)' },
         },
         required: ['topic', 'text'],
       },
@@ -384,13 +385,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const msg = args.text as string
         const retain = (args.retain as boolean) ?? false
         const correlationId = args.correlation_id as string | undefined
-        mqttClient.publish(topic, JSON.stringify({
+        const raw = (args.raw as boolean) ?? false
+        const payload = raw ? msg : JSON.stringify({
           sender: SESSION_NAME,
           ts: new Date().toISOString(),
           content: msg,
           ...(correlationId && { correlation_id: correlationId }),
-        }), { qos: QOS, retain })
-        return text(`Published to ${topic}`)
+        })
+        mqttClient.publish(topic, payload, { qos: QOS, retain })
+        return text(`Published to ${topic}${raw ? ' (raw)' : ''}`)
       }
 
       case 'request': {
