@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-mqtt",
+  "owner": {
+    "name": "Matt Stein"
+  },
+  "metadata": {
+    "description": "MQTT channel plugin for Claude Code - cross-session messaging, Home Assistant, and IoT bridge"
+  },
+  "plugins": [
+    {
+      "name": "mqtt",
+      "source": "./",
+      "description": "MQTT channel plugin - bridges MQTT messages into Claude Code sessions for cross-session communication, Home Assistant integration, and IoT workflows",
+      "version": "0.2.0"
+    }
+  ]
+}
