@@ -1,6 +1,6 @@
 {
   "name": "claude-code-mqtt",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MQTT channel plugin for Claude Code — cross-session messaging, Home Assistant integration, and IoT bridge",
   "type": "module",
   "bin": "./server.ts",

@@ -23,6 +23,35 @@ Agents stay lean by default. They only see what they've explicitly opted into.
 
 Admission, watch, and mute lists persist across session restarts in a JSON config file. Each session gets its own config — the email session admits different things than the coding session.
 
+## Message format
+
+### Outbound (publish)
+
+By default, `publish` wraps messages in a JSON envelope:
+
+```json
+{"sender": "session-name", "ts": "2026-03-27T...", "content": "your message"}
+```
+
+Set `raw: true` to send the text as-is — useful for publishing to systems that expect plain strings (e.g., Home Assistant command topics):
+
+```
+publish topic="homeassistant/switch/office/set" text="ON" raw=true
+```
+
+### Inbound (receive)
+
+The plugin accepts both formats:
+
+- **JSON envelope** — `{"sender": "name", "content": "..."}` — sender and content are extracted
+- **Plain string** — any non-JSON payload is used as content directly, with sender set to `unknown`
+
+This means you can receive messages from systems that don't know about the envelope format (IoT devices, Home Assistant, other MQTT clients).
+
+### Broker subscriptions
+
+When you `admit` or `watch` a topic, the plugin automatically subscribes to it on the broker. When you `unadmit` or `unwatch`, it unsubscribes (unless the other list still needs it). Persisted topics are re-subscribed on reconnect.
+
 ## Health monitoring
 
 Each session publishes a retained status message to `claude/sessions/<name>/status` with a `lastSeen` timestamp updated every 60 seconds (configurable). On clean shutdown, status flips to `offline`. On crash, MQTT's Last Will & Testament does it automatically.
@@ -91,7 +120,7 @@ SESSION_NAME=primary claude --dangerously-load-development-channels server:mqtt
 
 | Tool | Description |
 |---|---|
-| `publish` | Send a message to any MQTT topic |
+| `publish` | Send a message to any MQTT topic (supports `raw` flag to skip JSON envelope) |
 | `reply` | Publish a response to a topic |
 | `request` | Send a message and wait for a correlated response |
 | `admit` | Allow a sender/topic to flow directly into context (persists) |
