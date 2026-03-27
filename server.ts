@@ -95,7 +95,7 @@ function saveSessionConfig(config: SessionConfig) {
   writeFileSync(SESSION_CONFIG_FILE, JSON.stringify(config, null, 2))
 }
 
-let sessionConfig = loadSessionConfig()
+const sessionConfig = loadSessionConfig()
 
 // ── Message buffer ───────────────────────────────────────────────────────────
 
