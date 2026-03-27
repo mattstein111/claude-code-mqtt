@@ -5,7 +5,7 @@
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
-    "start": "bun run server.ts",
+    "start": "bun install --no-summary && bun server.ts",
     "dev": "bun run --watch server.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit"
