@@ -646,10 +646,12 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
         method: 'notifications/claude/channel',
         params: { content, meta },
       })
+      return
     } catch (e) {
-      log(`Failed to push notification: ${e}`)
+      log(`Failed to push notification, buffering instead: ${e}`)
+      bufferMessage({ topic, sender, content, timestamp })
+      return
     }
-    return
   }
 
   // Watched → buffer silently for on-demand reading
