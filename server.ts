@@ -3,8 +3,9 @@
  * MQTT channel plugin for Claude Code.
  *
  * Bridges MQTT messages into Claude Code sessions via the MCP channel protocol.
- * Messages are buffered by default — only admitted senders/topics flow into
- * Claude's context. Everything else queues until explicitly read.
+ * Three tiers: admitted = real-time into context, watched = buffered for pull,
+ * muted = silently dropped. Everything else is discarded. Agents stay lean by
+ * default and only pull context when they need it.
  *
  * Launch: SESSION_NAME=my-session claude --dangerously-load-development-channels server:mqtt
  *
@@ -42,6 +43,7 @@ const MQTT_USERNAME = process.env.MQTT_USERNAME
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD
 const SESSION_NAME = process.env.SESSION_NAME ?? 'default'
 const QOS = parseInt(process.env.QOS ?? '1', 10) as 0 | 1 | 2
+const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL ?? '60', 10) * 1000  // default: 60s
 
 const log = (msg: string) => process.stderr.write(`[mqtt-channel:${SESSION_NAME}] ${msg}\n`)
 
@@ -53,7 +55,8 @@ const SESSION_CONFIG_FILE = join(SESSIONS_DIR, `${SESSION_NAME}.json`)
 
 interface SessionConfig {
   admitted: string[]       // sender names or topic patterns that flow directly into context
-  muted: string[]          // sender names or topic patterns to silently drop (not even buffered)
+  muted: string[]          // sender names or topic patterns to silently drop
+  watched: string[]        // topic patterns to buffer on-demand (pull model — agent must explicitly watch)
   bufferMaxAge: number     // max age in seconds before buffer entries are dropped (default: 3600)
   bufferMaxPerTopic: number // max buffered messages per topic (default: 50)
 }
@@ -70,6 +73,7 @@ function defaultConfig(): SessionConfig {
   return {
     admitted: [`chachi/sessions/${SESSION_NAME}/inbox`],  // always admit our own inbox
     muted: [],
+    watched: [],
     bufferMaxAge: 3600,
     bufferMaxPerTopic: 50,
   }
@@ -132,6 +136,15 @@ function isMuted(sender: string, topic: string): boolean {
   })
 }
 
+function isWatched(sender: string, topic: string): boolean {
+  return sessionConfig.watched.some(pattern => {
+    if (sender === pattern) return true
+    const prefix = pattern.replace(/#$/, '')
+    if (topic === pattern || topic.startsWith(prefix)) return true
+    return false
+  })
+}
+
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -142,14 +155,17 @@ const mcp = new Server(
       tools: {},
     },
     instructions: [
-      `You are session "${SESSION_NAME}". Messages from MQTT arrive as <channel source="mqtt" topic="..." sender="..." ts="...">. Only admitted senders/topics reach you directly — everything else is buffered.`,
+      `You are session "${SESSION_NAME}". Messages from MQTT arrive as <channel source="mqtt" topic="..." sender="..." ts="...">. Only admitted senders/topics reach you directly — everything else is silently discarded.`,
+      '',
+      'Message flow: admitted = real-time into context, muted = silently dropped, watched = buffered for on-demand reading, everything else = discarded.',
       '',
       'Tools:',
       '  reply/publish — send messages to MQTT topics',
-      '  inbox — see buffered messages (not yet admitted into your context)',
-      '  admit — allow a sender or topic to flow directly into context (persists across restarts)',
+      '  admit — allow a sender or topic to flow directly into context (persists)',
       '  mute — silently drop messages from a sender or topic (persists)',
-      '  config — view or update session settings (buffer limits, admissions, mutes)',
+      '  watch — buffer messages from a topic for on-demand reading (pull model)',
+      '  inbox — read buffered messages from watched topics',
+      '  config — view or update session settings',
       '',
       'To message another session: publish to chachi/sessions/<name>/inbox',
       'Your inbox: chachi/sessions/' + SESSION_NAME + '/inbox',
@@ -188,13 +204,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'inbox',
-      description: 'View buffered messages. Shows summary by default, or read messages from a specific topic.',
+      description: 'Read buffered messages from watched topics. Only topics added via "watch" will have messages here.',
       inputSchema: {
         type: 'object',
         properties: {
-          topic: { type: 'string', description: 'Read messages from this specific topic (omit for summary)' },
+          topic: { type: 'string', description: 'Read messages from this specific topic (omit for summary of all watched topics)' },
           clear: { type: 'boolean', description: 'Clear the buffer for this topic after reading' },
         },
+      },
+    },
+    {
+      name: 'watch',
+      description: 'Start buffering messages from a topic for on-demand reading via inbox. Pull model — messages accumulate silently until you read them. Persists across restarts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Sender name or topic pattern to watch (e.g., "homeassistant/sensor/temperature")' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'unwatch',
+      description: 'Stop buffering messages from a topic. Clears any buffered messages for this pattern.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Pattern to stop watching' },
+        },
+        required: ['pattern'],
       },
     },
     {
@@ -221,7 +259,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'unadmit',
-      description: 'Remove a sender or topic from the admitted list. Messages will be buffered instead.',
+      description: 'Remove a sender or topic from the admitted list. Messages will be discarded unless also watched.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -356,6 +394,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return text(`Unmuted "${pattern}".`)
       }
 
+      case 'watch': {
+        const pattern = args.pattern as string
+        if (!sessionConfig.watched.includes(pattern)) {
+          sessionConfig.watched.push(pattern)
+          saveSessionConfig(sessionConfig)
+        }
+        return text(`Watching "${pattern}" — messages will buffer silently. Use inbox to read them.`)
+      }
+
+      case 'unwatch': {
+        const pattern = args.pattern as string
+        sessionConfig.watched = sessionConfig.watched.filter(p => p !== pattern)
+        saveSessionConfig(sessionConfig)
+        // Clear any buffered messages for this pattern
+        for (const topic of buffer.keys()) {
+          const prefix = pattern.replace(/#$/, '')
+          if (topic === pattern || topic.startsWith(prefix)) {
+            buffer.delete(topic)
+          }
+        }
+        return text(`Stopped watching "${pattern}". Buffer cleared.`)
+      }
+
       case 'config': {
         if (args.bufferMaxAge !== undefined) {
           sessionConfig.bufferMaxAge = args.bufferMaxAge as number
@@ -407,6 +468,16 @@ const mqttClient = mqtt.connect(BROKER_URL, {
 
 log(`Connecting to ${BROKER_URL}...`)
 
+const startedAt = new Date().toISOString()
+
+function publishStatus() {
+  mqttClient.publish(
+    `chachi/sessions/${SESSION_NAME}/status`,
+    JSON.stringify({ status: 'online', lastSeen: new Date().toISOString(), startedAt, session: SESSION_NAME }),
+    { qos: 1, retain: true },
+  )
+}
+
 mqttClient.on('connect', () => {
   log('Connected to broker')
   for (const topic of activeSubscriptions) {
@@ -415,12 +486,11 @@ mqttClient.on('connect', () => {
       else log(`Subscribed to ${topic}`)
     })
   }
-  mqttClient.publish(
-    `chachi/sessions/${SESSION_NAME}/status`,
-    JSON.stringify({ status: 'online', ts: new Date().toISOString(), session: SESSION_NAME }),
-    { qos: 1, retain: true },
-  )
+  publishStatus()
 })
+
+// Heartbeat — update lastSeen on retained status message every HEARTBEAT_INTERVAL
+const heartbeat = setInterval(publishStatus, HEARTBEAT_INTERVAL)
 
 mqttClient.on('error', (e) => log(`MQTT error: ${e.message}`))
 mqttClient.on('reconnect', () => log('Reconnecting...'))
@@ -464,18 +534,25 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
     return
   }
 
-  // Not admitted → buffer
-  log(`[buffered] ${sender} on ${topic}: ${content.substring(0, 80)}`)
-  bufferMessage({ topic, sender, content, timestamp })
+  // Watched → buffer silently for on-demand reading
+  if (isWatched(sender, topic)) {
+    log(`[watched] ${sender} on ${topic}: ${content.substring(0, 80)}`)
+    bufferMessage({ topic, sender, content, timestamp })
+    return
+  }
+
+  // Not admitted, not watched → discard
+  log(`[discarded] ${sender} on ${topic}`)
 })
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 function shutdown() {
   log('Shutting down...')
+  clearInterval(heartbeat)
   mqttClient.publish(
     `chachi/sessions/${SESSION_NAME}/status`,
-    JSON.stringify({ status: 'offline', ts: new Date().toISOString() }),
+    JSON.stringify({ status: 'offline', lastSeen: new Date().toISOString(), startedAt, session: SESSION_NAME }),
     { qos: 1, retain: true },
     () => { mqttClient.end(); process.exit(0) },
   )
