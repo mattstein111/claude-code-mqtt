@@ -42,11 +42,23 @@ try {
 const BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://localhost:1883'
 const MQTT_USERNAME = process.env.MQTT_USERNAME
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD
-const SESSION_NAME = process.env.SESSION_NAME ?? 'default'
 const TOPIC_PREFIX = process.env.MQTT_TOPIC_PREFIX ?? 'chachi'
 const QOS = parseInt(process.env.QOS ?? '1', 10) as 0 | 1 | 2
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL ?? '60', 10) * 1000  // default: 60s
 const REQUEST_TIMEOUT = parseInt(process.env.MQTT_REQUEST_TIMEOUT ?? '120', 10) * 1000  // default: 120s
+const MAX_PAYLOAD_BYTES = parseInt(process.env.MQTT_MAX_PAYLOAD_BYTES ?? String(20 * 1024 * 1024), 10) // default: 20MB
+const MAX_PENDING_REQUESTS = parseInt(process.env.MQTT_MAX_PENDING_REQUESTS ?? '50', 10) // default: 50
+
+// Sanitize session name to prevent path traversal
+const RAW_SESSION_NAME = process.env.SESSION_NAME ?? 'default'
+const SESSION_NAME = RAW_SESSION_NAME.replace(/[^a-zA-Z0-9_-]/g, '')
+if (SESSION_NAME !== RAW_SESSION_NAME) {
+  process.stderr.write(`[mqtt-channel] WARNING: SESSION_NAME sanitized from "${RAW_SESSION_NAME}" to "${SESSION_NAME}"\n`)
+}
+if (SESSION_NAME.length === 0) {
+  process.stderr.write(`[mqtt-channel] ERROR: SESSION_NAME is empty after sanitization\n`)
+  process.exit(1)
+}
 
 const log = (msg: string) => process.stderr.write(`[mqtt-channel:${SESSION_NAME}] ${msg}\n`)
 
@@ -384,6 +396,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'request': {
+        if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+          return err(`Too many pending requests (${MAX_PENDING_REQUESTS}). Wait for existing requests to complete.`)
+        }
         const target = args.target as string
         const msg = args.text as string
         const timeoutSecs = (args.timeout as number) ?? (REQUEST_TIMEOUT / 1000)
@@ -581,6 +596,12 @@ mqttClient.on('reconnect', () => log('Reconnecting...'))
 // ── Inbound message handler ─────────────────────────────────────────────────
 
 mqttClient.on('message', async (topic: string, payload: Buffer) => {
+  // Reject oversized payloads
+  if (payload.length > MAX_PAYLOAD_BYTES) {
+    log(`[dropped] Payload too large (${(payload.length / 1024 / 1024).toFixed(1)}MB) on ${topic}`)
+    return
+  }
+
   let sender = 'unknown'
   let content = ''
   let correlationId: string | undefined
