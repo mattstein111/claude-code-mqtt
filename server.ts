@@ -200,13 +200,16 @@ const mcp = new Server(
       'Message flow: admitted = real-time into context, muted = silently dropped, watched = buffered for on-demand reading, everything else = discarded.',
       '',
       'Tools:',
-      '  reply/publish — send messages to MQTT topics',
+      '  reply/publish — send messages to MQTT topics (raw=true skips JSON envelope, for IoT devices)',
       '  request — send a message and wait for a correlated response (synchronous request/reply pattern)',
       '  admit — allow a sender or topic to flow directly into context (persists)',
       '  mute — silently drop messages from a sender or topic (persists)',
       '  watch — buffer messages from a topic for on-demand reading (pull model)',
       '  inbox — read buffered messages from watched topics',
       '  config — view or update session settings',
+      '  subscribe/unsubscribe — manage broker-level topic subscriptions (admit/watch auto-subscribe)',
+      '',
+      'Use admit for topics you need to react to immediately. Use watch for topics you want to check periodically via inbox.',
       '',
       `To message another session: publish to ${TOPIC_PREFIX}/sessions/<name>/inbox`,
       `Your inbox: ${topics.inbox()}`,
@@ -230,6 +233,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           topic: { type: 'string', description: 'MQTT topic to publish to' },
           text: { type: 'string', description: 'Message content' },
           correlation_id: { type: 'string', description: 'Optional correlation ID if replying to a request' },
+          retain: { type: 'boolean', description: 'Retain the message on the broker (default: false)' },
+          raw: { type: 'boolean', description: 'Send text as-is without JSON envelope (default: false)' },
         },
         required: ['topic', 'text'],
       },
@@ -355,7 +360,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          topic: { type: 'string', description: 'MQTT topic or pattern (supports + and # wildcards)' },
+          topic: { type: 'string', description: 'MQTT topic or pattern (supports # wildcard)' },
         },
         required: ['topic'],
       },
@@ -412,7 +417,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
           return err(`Too many pending requests (${MAX_PENDING_REQUESTS}). Wait for existing requests to complete.`)
         }
-        const target = requireString('target')
+        const target = requireString('target').replace(/[^a-zA-Z0-9_-]/g, '')
+        if (target.length === 0) return err('Invalid target session name')
         const msg = requireString('text')
         const rawTimeout = typeof args.timeout === 'number' ? args.timeout : REQUEST_TIMEOUT / 1000
         const timeoutSecs = Math.max(1, Math.min(rawTimeout, 600))
@@ -453,7 +459,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'inbox': {
-        const topic = args.topic as string | undefined
+        const topic = typeof args.topic === 'string' ? args.topic : undefined
         const clear = (args.clear as boolean) ?? false
 
         if (topic) {
@@ -544,11 +550,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case 'config': {
         let changed = false
-        if (typeof args.bufferMaxAge === 'number' && args.bufferMaxAge > 0) {
+        if (typeof args.bufferMaxAge === 'number' && args.bufferMaxAge > 0 && args.bufferMaxAge <= 86400) {
           sessionConfig.bufferMaxAge = Math.floor(args.bufferMaxAge)
           changed = true
         }
-        if (typeof args.bufferMaxPerTopic === 'number' && args.bufferMaxPerTopic > 0) {
+        if (typeof args.bufferMaxPerTopic === 'number' && args.bufferMaxPerTopic > 0 && args.bufferMaxPerTopic <= 10000) {
           sessionConfig.bufferMaxPerTopic = Math.floor(args.bufferMaxPerTopic)
           changed = true
         }
