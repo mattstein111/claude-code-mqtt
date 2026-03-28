@@ -23,8 +23,14 @@ import {
 import mqtt from 'mqtt'
 import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
+
+// ── Version (single source of truth from package.json) ──────────────────────
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const PKG_VERSION: string = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -34,8 +40,18 @@ const ENV_FILE = join(STATE_DIR, '.env')
 // Load .env into process.env (real env wins)
 try {
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const eqIdx = trimmed.indexOf('=')
+    if (eqIdx < 1) continue
+    const key = trimmed.slice(0, eqIdx).trim()
+    if (!/^\w+$/.test(key)) continue
+    let val = trimmed.slice(eqIdx + 1).trim()
+    // Strip matching quotes
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1)
+    }
+    if (process.env[key] === undefined) process.env[key] = val
   }
 } catch {}
 
@@ -152,14 +168,21 @@ function matchesPattern(sender: string, topic: string, pattern: string): boolean
   if (sender === pattern) return true
   // Exact match by topic
   if (topic === pattern) return true
-  // Match by topic pattern with # multi-level wildcard (must follow a /)
-  if (pattern.endsWith('/#')) {
-    const prefix = pattern.slice(0, -1) // keep the trailing /
-    if (topic.startsWith(prefix)) return true
-  } else if (pattern === '#') {
-    return true // match everything
+  // Match everything
+  if (pattern === '#') return true
+
+  // MQTT wildcard matching: supports + (single level) and # (multi-level suffix)
+  const patternParts = pattern.split('/')
+  const topicParts = topic.split('/')
+
+  for (let i = 0; i < patternParts.length; i++) {
+    if (patternParts[i] === '#') return true // # matches all remaining levels
+    if (i >= topicParts.length) return false  // pattern is longer than topic
+    if (patternParts[i] === '+') continue     // + matches any single level
+    if (patternParts[i] !== topicParts[i]) return false
   }
-  return false
+
+  return patternParts.length === topicParts.length
 }
 
 function isAdmitted(sender: string, topic: string): boolean {
@@ -188,7 +211,7 @@ const pendingRequests = new Map<string, PendingRequest>()
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'mqtt', version: '0.3.0' },
+  { name: 'mqtt', version: PKG_VERSION },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
@@ -241,12 +264,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'publish',
-      description: 'Publish a message to any MQTT topic. Use raw=true to send the text as-is without the JSON envelope.',
+      description: 'Publish a message to any MQTT topic. Alias for reply — accepts the same options. Use raw=true to send the text as-is without the JSON envelope.',
       inputSchema: {
         type: 'object',
         properties: {
           topic: { type: 'string', description: 'MQTT topic' },
           text: { type: 'string', description: 'Message content' },
+          correlation_id: { type: 'string', description: 'Optional correlation ID if replying to a request' },
           retain: { type: 'boolean', description: 'Retain the message on the broker (default: false)' },
           raw: { type: 'boolean', description: 'Send text as-is without JSON envelope (default: false)' },
         },
@@ -375,6 +399,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['topic'],
       },
+    },
+    {
+      name: 'status',
+      description: 'Show current session state: admitted/watched/muted lists, active broker subscriptions, and buffer stats.',
+      inputSchema: { type: 'object', properties: {} },
     },
   ],
 }))
@@ -542,9 +571,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           mqttClient.unsubscribe(pattern)
           activeSubscriptions.delete(pattern)
         }
-        // Clear any buffered messages for this pattern
-        const toDelete = [...buffer.keys()].filter(topic => matchesPattern('', topic, pattern))
-        for (const topic of toDelete) buffer.delete(topic)
+        // Clear buffered messages matching the pattern (by topic or sender)
+        for (const [topic, msgs] of buffer.entries()) {
+          const remaining = msgs.filter(m => !matchesPattern(m.sender, m.topic, pattern))
+          if (remaining.length === 0) buffer.delete(topic)
+          else buffer.set(topic, remaining)
+        }
         return text(`Stopped watching "${pattern}". Buffer cleared.`)
       }
 
@@ -574,6 +606,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         mqttClient.unsubscribe(topic)
         activeSubscriptions.delete(topic)
         return text(`Unsubscribed from ${topic}`)
+      }
+
+      case 'status': {
+        const bufferStats: Record<string, number> = {}
+        for (const [t, msgs] of buffer.entries()) bufferStats[t] = msgs.length
+        return text(JSON.stringify({
+          session: SESSION_NAME,
+          version: PKG_VERSION,
+          broker: BROKER_URL,
+          admitted: sessionConfig.admitted,
+          watched: sessionConfig.watched,
+          muted: sessionConfig.muted,
+          activeSubscriptions: [...activeSubscriptions],
+          pendingRequests: pendingRequests.size,
+          buffer: bufferStats,
+          bufferMaxAge: sessionConfig.bufferMaxAge,
+          bufferMaxPerTopic: sessionConfig.bufferMaxPerTopic,
+        }, null, 2))
       }
 
       default:
@@ -628,6 +678,18 @@ mqttClient.on('connect', () => {
 
 // Heartbeat — update lastSeen on retained status message every HEARTBEAT_INTERVAL
 const heartbeat = setInterval(publishStatus, HEARTBEAT_INTERVAL)
+
+// Buffer sweep — prune stale messages every 5 minutes (bufferMessage only prunes on insert)
+const BUFFER_SWEEP_INTERVAL = 5 * 60 * 1000
+const bufferSweep = setInterval(() => {
+  const cutoff = Date.now() - sessionConfig.bufferMaxAge * 1000
+  for (const [topic, msgs] of buffer.entries()) {
+    while (msgs.length > 0 && new Date(msgs[0].timestamp).getTime() < cutoff) {
+      msgs.shift()
+    }
+    if (msgs.length === 0) buffer.delete(topic)
+  }
+}, BUFFER_SWEEP_INTERVAL)
 
 mqttClient.on('error', (e) => log(`MQTT error: ${e.message}`))
 mqttClient.on('reconnect', () => log('Reconnecting...'))
@@ -712,13 +774,7 @@ mqttClient.on('message', async (topic: string, payload: Buffer) => {
 function shutdown() {
   log('Shutting down...')
   clearInterval(heartbeat)
-
-  // Force exit if graceful shutdown stalls (e.g., broker unreachable)
-  const forceExit = setTimeout(() => {
-    log('Shutdown timeout — forcing exit')
-    process.exit(1)
-  }, 5000)
-  forceExit.unref()
+  clearInterval(bufferSweep)
 
   // Clean up pending requests
   for (const [id, pending] of pendingRequests) {
@@ -727,12 +783,18 @@ function shutdown() {
     pendingRequests.delete(id)
   }
 
+  // Publish offline status, then disconnect
   mqttClient.publish(
     topics.status(),
     JSON.stringify({ status: 'offline', lastSeen: new Date().toISOString(), startedAt, session: SESSION_NAME }),
     { qos: 1, retain: true },
-    () => { mqttClient.end(); process.exit(0) },
   )
+
+  // Give the offline message a moment to send, then force-close
+  setTimeout(() => {
+    mqttClient.end(true)
+    process.exit(0)
+  }, 1000)
 }
 
 process.on('unhandledRejection', (e) => log(`Unhandled rejection: ${e}`))

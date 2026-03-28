@@ -23,7 +23,7 @@ Agents stay lean by default. They only see what they've explicitly opted into.
 
 Admission, watch, and mute lists persist across session restarts in a JSON config file. Each session gets its own config — the email session admits different things than the coding session.
 
-**Topic matching:** Patterns support the MQTT `#` multi-level wildcard as a suffix (e.g., `homeassistant/sensor/#` matches all subtopics). The `+` single-level wildcard is not currently supported in gating patterns — use specific topic paths or `#` suffixes instead.
+**Topic matching:** Patterns support standard MQTT wildcards — `#` for multi-level (e.g., `homeassistant/sensor/#` matches all subtopics) and `+` for single-level (e.g., `homeassistant/+/temperature` matches any device's temperature topic).
 
 ## Message format
 
@@ -158,6 +158,7 @@ SESSION_NAME=primary claude --dangerously-load-development-channels server:mqtt
 | `config` | View or update session settings |
 | `subscribe` | Subscribe to a new MQTT topic at runtime (admit/watch auto-subscribe, so this is rarely needed) |
 | `unsubscribe` | Unsubscribe from a topic |
+| `status` | Show current session state: admitted/watched/muted lists, subscriptions, and buffer stats |
 
 ## Cross-session messaging
 
