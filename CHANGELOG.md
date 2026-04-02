@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-02
+
+### Added
+- `+` single-level wildcard support in gating patterns (MQTT standard)
+- `status` tool for session introspection (admitted/watched/muted lists, subscriptions, buffer stats)
+- Periodic buffer sweep to evict expired messages
+- Unit tests for `matchesPattern` and `.env` parser
+- `unwatch` now cleans up buffered messages by sender+topic
+
+### Changed
+- Robust `.env` parser: handles quotes, comments, and `=` in values
+- `reply` and `publish` tools now have feature parity
+- Version reported from `package.json` instead of hardcoded
+- Cleaner shutdown sequence
+
+### Fixed
+- Plugin manifest version synced with package.json
+
 ## [0.3.0] - 2026-03-27
 
 ### Added
